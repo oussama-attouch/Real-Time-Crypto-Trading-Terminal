@@ -1,0 +1,387 @@
+﻿# ==============================================================================
+# Real-Time Crypto Trading Terminal :: Phase 1
+#
+#   Binance Futures WS  ->  Ingestion (WebFlux client)  ->  Kafka
+#                       ->  Delivery (@KafkaListener)   ->  STOMP /topic/trades
+#
+# Conventions
+#   * Every infra endpoint is env-overridable (${ENV:default}) so the same jar
+#     runs on a laptop, in compose, and in CI without profile juggling.
+#   * Framework-managed versions only: no hand-pinned library versions here.
+#   * terminal.* is our own namespace, bound by @ConfigurationProperties in
+#     Steps 2-3 (com.terminal.config.*Properties).
+# ==============================================================================
+
+server:
+  port: ${SERVER_PORT:8080}
+  # Let in-flight STOMP frames flush and the Kafka listener container stop
+  # cleanly before the JVM exits.
+  shutdown: graceful
+  error:
+    include-message: always
+
+spring:
+  application:
+    name: crypto-trading-terminal
+  lifecycle:
+    timeout-per-shutdown-phase: 20s
+
+  main:
+    # Explicit, and load-bearing: MVC must win so STOMP/SockJS can be served by
+    # a servlet container. With both starters on the classpath Boot would deduce
+    # SERVLET anyway (see WebApplicationType.deduceFromClasspath), but we pin it
+    # so nobody "fixes" the reactive/blocking mix by accident later.
+    web-application-type: servlet
+
+  threads:
+    virtual:
+      # OFF deliberately. On JDK 21 virtual threads pin their carrier on
+      # synchronized blocks, and Spring's SockJS/SimpleBroker internals still use
+      # monitors. On a latency-sensitive path we prefer the proven platform-thread
+      # pools until we have a JFR measurement, and JDK 24+/JEP 491 removed the
+      # pinning constraint. Flip to true only with numbers in hand.
+      enabled: false
+
+  jackson:
+    default-property-inclusion: non_null
+    serialization:
+      write-dates-as-timestamps: false
+      # Prices/quantities are BigDecimal. Without this, Jackson emits 1.2E+4
+      # instead of 12000, which would corrupt the chart payload in the browser.
+      write-bigdecimal-as-plain: true
+    deserialization:
+      # Binance adds fields to its payloads over time; an unknown field must never
+      # kill the ingestion stream.
+      fail-on-unknown-properties: false
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL: provisioned in Phase 1, not on the hot path yet.
+  # Nothing in the ingestion (reactive) pipeline may touch this pool.
+  # ---------------------------------------------------------------------------
+  datasource:
+    url: jdbc:postgresql://localhost:5433/trading   # was /terminal
+    username: ${POSTGRES_USER:trader}
+    password: ${POSTGRES_PASSWORD:trader_dev_pw}
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      pool-name: terminal-hikari
+      maximum-pool-size: 10
+      minimum-idle: 2
+      connection-timeout: 3000
+      validation-timeout: 2000
+      idle-timeout: 600000
+      max-lifetime: 1800000
+      # < 0 == never validate the pool at startup. The service must boot with a
+      # cold database; connections are established lazily on first use.
+      initialization-fail-timeout: -1
+
+  # ---------------------------------------------------------------------------
+  # Write side (Phase 8)
+  # ---------------------------------------------------------------------------
+  flyway:
+    enabled: ${FLYWAY_ENABLED:true}
+    locations: classpath:db/migration
+    # Tolerates a database that already has objects but no flyway_schema_history
+    # (e.g. one created by an earlier docker init script) instead of refusing to start.
+    baseline-on-migrate: true
+
+  jpa:
+    # No lazy loading outside a request/transaction: a DTO mapping must not silently
+    # trigger a second query from the view layer.
+    open-in-view: false
+    hibernate:
+      # Flyway is the schema authority; Hibernate must never alter it.
+      ddl-auto: none
+    # Explicit dialect + no JDBC metadata at boot. Without these, Hibernate opens a
+    # connection during startup, which makes a Postgres outage a fatal startup failure
+    # even though the read side never touches the database. See PersistenceConfig.
+    database-platform: org.hibernate.dialect.PostgreSQLDialect
+    properties:
+      hibernate:
+        boot:
+          allow_jdbc_metadata_access: false
+        jdbc:
+          time_zone: UTC
+
+  # ---------------------------------------------------------------------------
+  # Kafka
+  # ---------------------------------------------------------------------------
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    client-id: ${spring.application.name}
+
+    admin:
+      # Do not abort startup when the broker is down. KafkaAdmin still retries in
+      # the background, and the listener container keeps reconnecting.
+      fail-fast: false
+      properties:
+        request.timeout.ms: 5000
+        default.api.timeout.ms: 10000
+
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      # JSON instead of Avro/Protobuf on purpose for Phase 1: the payload is read
+      # by a browser client and by a human tailing the topic. Schema Registry is
+      # a Phase 3 concern.
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      acks: all
+      properties:
+        # --- durability + ordering -------------------------------------------
+        # Idempotent producer: no duplicates and no reordering across internal
+        # retries. This is what makes "one key -> one partition -> ordered" hold
+        # under transient broker/network failures.
+        enable.idempotence: true
+        # Valid with idempotence only up to 5; keeps pipelining while guaranteeing
+        # order is preserved.
+        max.in.flight.requests.per.connection: 5
+
+        # --- latency vs throughput -------------------------------------------
+        # aggTrade on BTCUSDT is ~10-100 msg/s: batching barely helps, so we cap
+        # the added latency at 5ms. 32KB batches still coalesce bursts.
+        linger.ms: 5
+        batch.size: 32768
+        compression.type: lz4
+
+        # --- failure semantics ------------------------------------------------
+        delivery.timeout.ms: 120000
+        request.timeout.ms: 30000
+        # THE backpressure knob. When metadata is unavailable or the 32MB send
+        # buffer is full, KafkaProducer.send() blocks the CALLING thread. Capping
+        # it at 5s bounds that stall, and Step 2 keeps the call off the Netty
+        # event loop by publishing on a dedicated bounded scheduler.
+        max.block.ms: 5000
+        buffer.memory: 33554432
+
+        # Keep records lean: no __TypeId__ header on every trade. The consumer
+        # pins the concrete type instead (see spring.json.value.default.type).
+        spring.json.add.type.headers: false
+
+    consumer:
+      group-id: terminal-delivery-group
+      # A live ticker feed must show *now*, not yesterday's replay. Offsets are
+      # still committed, so a restarted consumer resumes where it left off.
+      auto-offset-reset: latest
+      # Commits are owned by the listener container (ack-mode below), not by the
+      # client poll loop.
+      enable-auto-commit: false
+      max-poll-records: 500
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      # ErrorHandlingDeserializer wraps JsonDeserializer so a malformed record becomes a
+      # recoverable record (raw bytes + exception header) instead of an endless re-poll
+      # of the same offset. Without this, DefaultErrorHandler is never invoked for a
+      # deserialization failure and a single poison pill stalls the partition forever.
+      value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+      properties:
+        spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JsonDeserializer
+        # Deserialize straight into the DTO; no type headers on the wire.
+        spring.json.value.default.type: com.terminal.ingestion.TradeEvent
+        spring.json.use.type.headers: false
+        # Defence in depth, only consulted if type headers are ever re-enabled.
+        spring.json.trusted.packages: com.terminal
+
+        # --- low-latency fetch ------------------------------------------------
+        fetch.min.bytes: 1
+        fetch.max.wait.ms: 100
+        max.poll.interval.ms: 300000
+        session.timeout.ms: 45000
+        heartbeat.interval.ms: 3000
+
+    listener:
+      type: single
+      # Commit after each record is handled: on a rebalance we may re-deliver
+      # (trade broadcast is idempotent in the UI) but we will not silently skip.
+      ack-mode: record
+      # 3 threads for 6 partitions. Note: one symbol is one key, so it maps to a
+      # single partition and only one thread will ever be hot for BTCUSDT. Extra
+      # concurrency is headroom for more symbols, not speed for one.
+      concurrency: 3
+      poll-timeout: 1000
+      # Never let a missing topic kill the app at boot.
+      missing-topics-fatal: false
+
+# ==============================================================================
+# Application configuration (bound in Steps 2-3)
+# ==============================================================================
+terminal:
+  binance:
+    # Kill switch: false keeps the socket closed (useful for tests and for running
+    # the delivery side alone while iterating).
+    enabled: ${BINANCE_INGESTION_ENABLED:true}
+
+    # Aggregated trades for BTCUSDT on Binance USD-M futures.
+    # /stream?streams=... (plural) wraps every message as {"stream":..,"data":..};
+    # the raw single-stream endpoint does not. Step 2 unwraps accordingly.
+    #
+    # TWO STREAMS, ONE SOCKET (since Step 8):
+    #   btcusdt@aggTrade          -> trades        (binance-raw-trades)
+    #   btcusdt@depth20@100ms     -> partial L2    (binance-depth)
+    # Combined streams are '/'-separated inside the single `streams=` parameter.
+    #
+    # !! MEASURED CAVEAT (2026-11-19) !!
+    # From this machine fstream.binance.com completes the WebSocket upgrade and then
+    # sends ZERO frames â€” verified with the JDK's own java.net.http.WebSocket client, so
+    # it is not our code. The spot host is used here for that reason; it also serves the
+    # partial-depth stream we need. Verified live: ~25 aggTrade frames/s and ~10
+    # depth frames/s, payload {"lastUpdateId":...,"bids":[[p,q]],"asks":[[p,q]]}.
+    #
+    # Symptom if a host goes silent: the log shows "Binance WS: CONNECTED" but
+    # /actuator/metrics/terminal.ingestion.frames.received stays at 0.
+    url: ${BINANCE_WS_URL:wss://stream.binance.com:9443/stream?streams=btcusdt@aggTrade/btcusdt@depth20@100ms}
+
+    connect-timeout: 10s
+    handshake-timeout: 15s
+    # Staleness watchdog. aggTrade for BTCUSDT emits many frames per second, so
+    # silence for this long means the socket is dead even if the OS has not noticed.
+    idle-timeout: 90s
+    # aggTrade frames are tiny; 1MB is generous and protects the decoder.
+    max-frame-payload-length: 1048576
+
+    reconnect:
+      # Exponential backoff between reconnect attempts: 1s, 2s, 4s ... capped at 30s.
+      # Jitter is mandatory: without it, every replica of every service hammers Binance
+      # in lockstep after an outage and gets rate-limited/banned.
+      initial-backoff: 1s
+      max-backoff: 30s
+      # Informational only: Reactor's Retry.backoff doubles per attempt.
+      multiplier: 2.0
+      jitter-factor: 0.5
+      # 0 == retry forever (mapped to Long.MAX_VALUE). A market data feed must never
+      # give up: the only alternatives are "retry" or "be wrong".
+      max-attempts: 0
+
+    scheduler:
+      # Dedicated bounded scheduler for the Kafka publish step. KafkaProducer.send()
+      # can block up to max.block.ms, so it must never run on a reactor-netty
+      # event-loop thread.
+      thread-prefix: binance-ingest
+      pool-size: 2
+      queue-capacity: 4096
+      # publishOn() buffer between the Netty read loop and the publish stage. This is
+      # the pipeline's ONLY buffer: when it fills, demand stops and TCP backpressure
+      # propagates to Binance. Bigger = more tolerance to Kafka hiccups, more memory
+      # and more stale ticks in flight.
+      prefetch: 256
+
+  kafka:
+    topics:
+      raw-trades: binance-raw-trades
+      # Dead-letter topic for records that cannot be deserialized/handled.
+      raw-trades-dlt: binance-raw-trades.DLT
+      # Finalized 1-minute candles produced by TradeAggregator.
+      klines-1m: binance-klines-1m
+      # Real partial L2 depth straight from @depth20@100ms, keyed by symbol.
+      depth: binance-depth
+      # Orders accepted by the write side (Phase 8), keyed by symbol.
+      orders: order-events
+      # 6 partitions: ordering is guaranteed per symbol key, and headroom exists
+      # to scale consumers by adding symbols. Partition count can only grow, so
+      # starting at 6 avoids a rebalance-heavy repartition later.
+      partitions: 6
+      replicas: 1
+      retention: 24h
+
+  aggregation:
+    # How long a just-closed candle stays open to late trades. A trade whose tradeTime
+    # belongs to the previous minute, arriving within this window, is merged into that
+    # candle and the corrected candle is republished. Beyond it, the trade is dropped and
+    # counted (terminal.aggregation.late.dropped) rather than silently corrupting either
+    # candle. 5s covers exchange-side jitter and short pipeline hiccups without letting
+    # the chart rewrite history.
+    late-tolerance: ${AGGREGATION_LATE_TOLERANCE:5s}
+
+  orderbook:
+    # Levels per side that the broadcaster sends and the UI renders (@depth20 => 20).
+    depth: ${ORDERBOOK_DEPTH:20}
+    # No pruning: the book is now Binance's real partial depth, not a synthetic
+    # trade-driven profile, so there is nothing stale to clean up. A level only exists
+    # because the exchange says it does.
+    # 10 Hz. Below ~50 ms the snapshot serialization starts to rival the ~10 frames/s the
+    # depth stream delivers.
+    broadcast-interval-ms: ${ORDERBOOK_BROADCAST_MS:100}
+    destination: /topic/orderbook
+
+  orders:
+    # Where OrderKafkaConsumer re-broadcasts confirmed orders for the UI toast/panel.
+    destination: /topic/orders
+
+  delivery:
+    # Last-N in-memory cache, served to every newly connected client so the first
+    # screen is populated instead of blank. 50 == the client's rendered row cap.
+    snapshot-capacity: ${SNAPSHOT_CAPACITY:50}
+    websocket:
+      endpoint: /ws-trades
+      application-prefix: /app
+      broker-prefix: /topic
+      trade-topic: /topic/trades
+      # Finalized 1-minute candles (upsert by closeTime; a late trade can republish one).
+      candle-topic: /topic/klines
+      # In-progress candle, pushed on every trade so the chart moves tick-by-tick.
+      live-candle-topic: /topic/klines/live
+      # Dev only. Lock this to the terminal's origin before deploying.
+      allowed-origin-patterns: "*"
+      # Per-client outbound buffer. A browser tab that stops draining (frozen VM,
+      # closed laptop) must not buffer unboundedly and OOM the JVM: past this
+      # limit the session is closed instead.
+      send-buffer-size-limit: 524288
+      send-time-limit: 10000
+      # Dedicated pool for the STOMP client-outbound channel so a slow client can
+      # never stall the Kafka consumer thread.
+      outbound-pool-size: 4
+      outbound-queue-capacity: 65536
+      # STOMP heartbeat, both directions. A half-open TCP connection (slept laptop,
+      # NAT rebind, dead proxy) produces no error and no close â€” just silence â€” so the
+      # client cannot tell "quiet market" from "dead socket". The server now proves
+      # liveness every interval; @stomp/stompjs declares a dead link after ~2 missed
+      # heartbeats and reconnects. 0 disables.
+      heartbeat: ${STOMP_HEARTBEAT:10s}
+
+# ==============================================================================
+# Observability
+# ==============================================================================
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,threaddump,loggers
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true
+  info:
+    env:
+      enabled: true
+  health:
+    #
+    # NOTE ON KAFKA HEALTH â€” there is no `management.health.kafka.enabled` here,
+    # and that is deliberate. Spring Boot 3.5 ships NO Kafka health indicator:
+    # inspecting spring-boot-actuator-autoconfigure-3.5.16.jar shows the only
+    # Kafka classes are KafkaMetricsAutoConfiguration (metrics, not health), and
+    # a live /actuator/health confirms no `kafka` component is registered. Such a
+    # key would be silently ignored, i.e. fake observability.
+    #
+    # What we get out of the box: db, diskSpace, ping, livenessState,
+    # readinessState. Step 3 adds a purpose-built ingestion-staleness indicator
+    # ("no trade in N seconds" is a far better signal than "TCP to broker OK").
+    #
+    # A DOWN dependency must never stop the process: this service has to survive a
+    # Kafka or Postgres outage and recover on its own.
+    db:
+      enabled: true
+
+logging:
+  level:
+    root: INFO
+    com.terminal: DEBUG
+    # Kafka client internals are extremely chatty; WARN surfaces real problems.
+    org.apache.kafka: WARN
+    org.springframework.kafka: INFO
+    reactor.netty: INFO
+    org.springframework.web.socket: INFO
+  pattern:
+    # Thread name first: it is how we prove the pipeline is non-blocking, e.g.
+    #   reactor-http-nio-2      -> WS read loop (never does I/O-bound work)
+    #   binance-ingest-1        -> Kafka publish
+    #   kafka-listener-1        -> @KafkaListener
+    #   clientOutboundChannel-1 -> STOMP fan-out
+    console: "%d{HH:mm:ss.SSS} %-5level %-30.30thread %-36.36logger{35} : %msg%n"

@@ -1,0 +1,64 @@
+# ---- build output -----------------------------------------------------------
+target/
+*.jar
+*.war
+*.class
+dependency-reduced-pom.xml
+
+# ---- Node / frontend --------------------------------------------------------
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ---- logs -------------------------------------------------------------------
+logs/
+*.log
+*.log.*
+
+# ---- IDE / editor -----------------------------------------------------------
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.settings/
+.project
+.classpath
+.factorypath
+*.swp
+*.swo
+
+# ---- OS noise ---------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- secrets / local overrides ---------------------------------------------
+# docker-compose reads .env automatically; never commit real credentials.
+.env
+.env.*
+!.env.example
+application-local.yml
+application-local.yaml
+*.pem
+*.p12
+*.jks
+
+# ---- local scratch ----------------------------------------------------------
+# Used only when ~/.m2 is not writable (sandboxed/CI runs).
+.m2repo/
+docker/data/
+pgdata/
+coverage/
+.history/
+*.tmp
+
+# ---- package manager caches (pnpm store lives in-repo when configured locally) ----
+.pnpm-store/
+.pnpm-store
+.yarn/cache/
+.pnp.*

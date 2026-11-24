@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Trading Terminal :: Trade Stream Test Client</title>
+    <style>
+        :root {
+            --bg: #0b0e13;
+            --panel: #141922;
+            --line: #232b38;
+            --text: #d7deea;
+            --dim: #7c8798;
+            --up: #26a69a;
+            --down: #ef5350;
+            --warn: #f0a020;
+        }
+
+        * { box-sizing: border-box; }
+
+        body {
+            margin: 0;
+            padding: 20px;
+            background: var(--bg);
+            color: var(--text);
+            font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        }
+
+        header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+            flex-wrap: wrap;
+            margin-bottom: 16px;
+        }
+
+        h1 { font-size: 15px; font-weight: 600; margin: 0; letter-spacing: .3px; }
+        h1 span { color: var(--dim); font-weight: 400; }
+
+        h2 {
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: .8px;
+            color: var(--dim);
+            margin: 22px 0 8px;
+        }
+
+        .pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 7px;
+            padding: 5px 12px;
+            border-radius: 999px;
+            border: 1px solid var(--line);
+            background: var(--panel);
+            font-size: 12px;
+        }
+
+        .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); flex: none; }
+
+        .pill.up { border-color: rgba(38, 166, 154, .5); color: var(--up); }
+        .pill.up .dot { background: var(--up); box-shadow: 0 0 8px var(--up); }
+        .pill.down { border-color: rgba(239, 83, 80, .5); color: var(--down); }
+        .pill.down .dot { background: var(--down); }
+        .pill.wait { border-color: rgba(240, 160, 32, .5); color: var(--warn); }
+        .pill.wait .dot { background: var(--warn); }
+
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 10px;
+            margin-bottom: 18px;
+        }
+
+        .stat {
+            background: var(--panel);
+            border: 1px solid var(--line);
+            border-radius: 6px;
+            padding: 10px 12px;
+        }
+
+        .stat label {
+            display: block;
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: .7px;
+            color: var(--dim);
+            margin-bottom: 4px;
+        }
+
+        .stat strong { font-size: 16px; font-weight: 600; }
+
+        /* live 1m candle strip */
+        .candle {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+            gap: 1px;
+            background: var(--line);
+            border: 1px solid var(--line);
+            border-radius: 6px;
+            overflow: hidden;
+            margin-bottom: 18px;
+        }
+
+        .candle div { background: var(--panel); padding: 10px 12px; }
+
+        .candle label {
+            display: block;
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: .7px;
+            color: var(--dim);
+            margin-bottom: 4px;
+        }
+
+        .candle strong { font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; }
+        .candle strong.up { color: var(--up); }
+        .candle strong.down { color: var(--down); }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: var(--panel);
+            border: 1px solid var(--line);
+            border-radius: 6px;
+            overflow: hidden;
+        }
+
+        thead th {
+            text-align: left;
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: .7px;
+            color: var(--dim);
+            font-weight: 500;
+            padding: 8px 10px;
+            border-bottom: 1px solid var(--line);
+            background: #10151d;
+        }
+
+        tbody td {
+            padding: 6px 10px;
+            border-bottom: 1px solid rgba(35, 43, 56, .6);
+            white-space: nowrap;
+        }
+
+        tbody tr:last-child td { border-bottom: none; }
+        tbody tr { animation: flash .6s ease-out; }
+
+        @keyframes flash {
+            from { background: rgba(38, 166, 154, .18); }
+            to { background: transparent; }
+        }
+
+        .num { text-align: right; font-variant-numeric: tabular-nums; }
+        .buy { color: var(--up); font-weight: 600; }
+        .sell { color: var(--down); font-weight: 600; }
+        .id { color: var(--dim); }
+        .empty { color: var(--dim); }
+
+        pre {
+            margin: 0;
+            padding: 12px;
+            background: var(--panel);
+            border: 1px solid var(--line);
+            border-radius: 6px;
+            color: #9fd0ff;
+            overflow: auto;
+            max-height: 220px;
+            font-size: 12px;
+        }
+
+        footer { margin-top: 18px; color: var(--dim); font-size: 11px; }
+        footer code { color: var(--text); }
+    </style>
+</head>
+<body>
+
+<header>
+    <h1>BTCUSDT&nbsp;·&nbsp;aggTrade&nbsp;<span>Kafka → STOMP → browser</span></h1>
+    <div id="status" class="pill wait">
+        <span class="dot"></span><span id="status-text">Connecting…</span>
+    </div>
+</header>
+
+<section class="stats">
+    <div class="stat"><label>Trades received</label><strong id="total">0</strong></div>
+    <div class="stat"><label>Rate (1s)</label><strong id="rate">0</strong></div>
+    <div class="stat"><label>Snapshot</label><strong id="snapshot">—</strong></div>
+    <div class="stat"><label>Last price</label><strong id="price">—</strong></div>
+    <div class="stat"><label>Last trade time</label><strong id="time">—</strong></div>
+    <div class="stat"><label>Candles closed</label><strong id="candles">0</strong></div>
+</section>
+
+<h2>Live 1m candle <span id="candle-window" style="text-transform:none;color:var(--dim)">—</span></h2>
+<section class="candle">
+    <div><label>Open</label><strong id="c-open">—</strong></div>
+    <div><label>High</label><strong id="c-high">—</strong></div>
+    <div><label>Low</label><strong id="c-low">—</strong></div>
+    <div><label>Close</label><strong id="c-close">—</strong></div>
+    <div><label>Volume</label><strong id="c-volume">—</strong></div>
+    <div><label>Trades</label><strong id="c-count">—</strong></div>
+</section>
+
+<table>
+    <thead>
+    <tr>
+        <th>Time</th>
+        <th>Side</th>
+        <th class="num">Price</th>
+        <th class="num">Quantity</th>
+        <th>Trade ID</th>
+    </tr>
+    </thead>
+    <tbody id="trades">
+    <tr><td colspan="5" class="empty">connecting…</td></tr>
+    </tbody>
+</table>
+
+<h2>Last raw STOMP payload</h2>
+<pre id="raw">waiting…</pre>
+
+<footer>
+    Endpoint <code id="endpoint"></code> · snapshot <code>/app/trades</code> ·
+    live <code>/topic/trades</code> · rows capped at <span id="cap"></span>
+</footer>
+
+<!-- SockJS: HTTP fallback transports if a proxy breaks the raw WS upgrade -->
+<script src="https://cdn.jsdelivr.net/npm/sockjs-client@1.6.1/dist/sockjs.min.js"></script>
+<!-- @stomp/stompjs v7 (UMD bundle exposes the global `StompJs`) -->
+<script src="https://cdn.jsdelivr.net/npm/@stomp/stompjs@7.0.0/bundles/stomp.umd.min.js"></script>
+
+<script>
+    'use strict';
+
+    // Served by the Spring app itself, so location.origin is http://localhost:8080.
+    const ENDPOINT = location.origin + '/ws-trades';
+    const SNAPSHOT_DESTINATION = '/app/trades';   // @SubscribeMapping reply, this client only
+    const LIVE_DESTINATION = '/topic/trades';     // simple-broker fan-out
+    const LIVE_CANDLE_DESTINATION = '/topic/klines/live';   // in-progress 1m candle, per trade
+    const CANDLE_DESTINATION = '/topic/klines';             // finalized 1m candles
+    const MAX_ROWS = 50;
+    const SEEN_CAPACITY = 500;                    // trade ids remembered for de-duplication
+    const SNAPSHOT_TIMEOUT_MS = 3000;
+
+    const ui = {
+        status: document.getElementById('status'),
+        statusText: document.getElementById('status-text'),
+        total: document.getElementById('total'),
+        rate: document.getElementById('rate'),
+        snapshot: document.getElementById('snapshot'),
+        price: document.getElementById('price'),
+        time: document.getElementById('time'),
+        trades: document.getElementById('trades'),
+        raw: document.getElementById('raw'),
+        candles: document.getElementById('candles'),
+        candleWindow: document.getElementById('candle-window'),
+        cOpen: document.getElementById('c-open'),
+        cHigh: document.getElementById('c-high'),
+        cLow: document.getElementById('c-low'),
+        cClose: document.getElementById('c-close'),
+        cVolume: document.getElementById('c-volume'),
+        cCount: document.getElementById('c-count')
+    };
+
+    document.getElementById('endpoint').textContent = ENDPOINT;
+    document.getElementById('cap').textContent = MAX_ROWS;
+
+    let total = 0;
+    let inWindow = 0;
+    let tableReady = false;
+    let snapshotLoaded = false;
+
+    // Live frames that arrive before the snapshot reply. They are newer than anything
+    // in the snapshot, so they are replayed on top once it lands — otherwise a fresh
+    // trade could end up buried underneath 50 historical rows.
+    const pendingLive = [];
+
+    // The snapshot and the live topic overlap by one or more trades (whatever was
+    // written between the buffer read and the fan-out). Rendering both verbatim shows
+    // the same trade twice, which in a ticker reads as a double print.
+    const seenTradeIds = new Set();
+
+    setInterval(() => {
+        ui.rate.textContent = inWindow;
+        inWindow = 0;
+    }, 1000);
+
+    function setStatus(state, text) {
+        ui.status.className = 'pill ' + state;
+        ui.statusText.textContent = text;
+    }
+
+    function rememberTradeId(id) {
+        if (id === null || id === undefined) {
+            return true;                    // nothing to compare, render it
+        }
+        if (seenTradeIds.has(id)) {
+            return false;
+        }
+        seenTradeIds.add(id);
+        if (seenTradeIds.size > SEEN_CAPACITY) {
+            // Set preserves insertion order, so this drops the oldest remembered id.
+            seenTradeIds.delete(seenTradeIds.values().next().value);
+        }
+        return true;
+    }
+
+    function cell(text, className) {
+        const td = document.createElement('td');
+        // textContent, never innerHTML: payload values must never be parsed as markup.
+        td.textContent = text;
+        if (className) { td.className = className; }
+        return td;
+    }
+
+    function formatTime(tradeTime) {
+        const t = Number(tradeTime);
+        if (!Number.isFinite(t)) { return '—'; }
+        return new Date(t).toLocaleTimeString('en-GB', { hour12: false })
+            + '.' + String(t % 1000).padStart(3, '0');
+    }
+
+    function buildRow(trade) {
+        // Binance `m` means "buyer is maker", i.e. the aggressor was the seller.
+        const sell = trade.isBuyerMaker === true;
+        const tr = document.createElement('tr');
+        tr.appendChild(cell(formatTime(trade.tradeTime)));
+        tr.appendChild(cell(sell ? 'SELL' : 'BUY', sell ? 'sell' : 'buy'));
+        tr.appendChild(cell(trade.price, 'num'));
+        tr.appendChild(cell(trade.quantity, 'num'));
+        tr.appendChild(cell(trade.tradeId, 'id'));
+        return tr;
+    }
+
+    function prepareTable() {
+        if (!tableReady) {
+            ui.trades.textContent = '';
+            tableReady = true;
+        }
+    }
+
+    function trimRows() {
+        while (ui.trades.childElementCount > MAX_ROWS) {
+            ui.trades.lastElementChild.remove();
+        }
+    }
+
+    function showLatest(trade) {
+        ui.price.textContent = trade.price;
+        ui.time.textContent = formatTime(trade.tradeTime);
+        ui.raw.textContent = JSON.stringify(trade, null, 2);
+    }
+
+    /** Snapshot rows arrive newest-first, so appending preserves the display order. */
+    function appendRow(trade) {
+        if (!rememberTradeId(trade.tradeId)) { return; }
+        prepareTable();
+        ui.trades.appendChild(buildRow(trade));
+        total += 1;
+        ui.total.textContent = total;
+        trimRows();
+    }
+
+    /** Live trades are newer than everything displayed: they go on top. */
+    function prependRow(trade) {
+        if (!rememberTradeId(trade.tradeId)) { return; }
+        prepareTable();
+        ui.trades.prepend(buildRow(trade));
+        total += 1;
+        inWindow += 1;
+        ui.total.textContent = total;
+        showLatest(trade);
+        trimRows();
+    }
+
+    function flushPendingLive() {
+        // Buffered in chronological order; each prepend puts the newest on top.
+        pendingLive.splice(0).forEach(prependRow);
+    }
+
+    function resetClientState() {
+        seenTradeIds.clear();
+        pendingLive.length = 0;
+        snapshotLoaded = false;
+        total = 0;
+        inWindow = 0;
+        tableReady = false;
+        ui.total.textContent = '0';
+        ui.snapshot.textContent = '—';
+    }
+
+    let closedCandles = 0;
+
+    // Prices stay strings end to end; the Number() below is only a display hint for the
+    // up/down colour and feeds nothing downstream.
+    function renderLiveCandle(candle) {
+        ui.cOpen.textContent = candle.open;
+        ui.cHigh.textContent = candle.high;
+        ui.cLow.textContent = candle.low;
+        ui.cClose.textContent = candle.close;
+        ui.cVolume.textContent = candle.volume;
+        ui.cCount.textContent = candle.tradeCount;
+        ui.cClose.className = Number(candle.close) >= Number(candle.open) ? 'up' : 'down';
+
+        const from = new Date(Number(candle.openTime)).toLocaleTimeString('en-GB', { hour12: false });
+        const to = new Date(Number(candle.closeTime)).toLocaleTimeString('en-GB', { hour12: false });
+        ui.candleWindow.textContent = from + ' → ' + to;
+    }
+
+    const client = new StompJs.Client({
+        webSocketFactory: () => new SockJS(ENDPOINT),
+        reconnectDelay: 5000,
+        debug: () => { }   // flip to console.log to see raw STOMP frames
+    });
+
+    client.onConnect = () => {
+        setStatus('up', 'Connected');
+        // A reconnect must rebuild the table from the new snapshot, so client-side
+        // state has to be cleared — otherwise the fresh snapshot is de-duplicated
+        // against stale ids and the table comes back empty.
+        resetClientState();
+
+        // Candle streams are independent of the trade snapshot, so subscribe immediately.
+        // /topic/klines/live fires on EVERY trade (in-progress candle), which is what makes
+        // the candle strip move tick by tick instead of once a minute.
+        client.subscribe(LIVE_CANDLE_DESTINATION, (frame) => {
+            try {
+                renderLiveCandle(JSON.parse(frame.body));
+            } catch (err) {
+                console.error('Unparseable live candle', err, frame.body);
+            }
+        });
+
+        // Finalized candles. A candle can arrive more than once for the same closeTime when
+        // a late trade corrects it, so this counts arrivals and any real chart should upsert
+        // by closeTime rather than append.
+        client.subscribe(CANDLE_DESTINATION, (frame) => {
+            try {
+                JSON.parse(frame.body);
+                closedCandles += 1;
+                ui.candles.textContent = closedCandles;
+            } catch (err) {
+                console.error('Unparseable candle', err, frame.body);
+            }
+        });
+
+        let guard = setTimeout(() => {
+            if (!snapshotLoaded) {
+                snapshotLoaded = true;
+                flushPendingLive();
+            }
+        }, SNAPSHOT_TIMEOUT_MS);
+
+        // 1) history
+        const snapshotSub = client.subscribe(SNAPSHOT_DESTINATION, (frame) => {
+            let trades = [];
+            try {
+                trades = JSON.parse(frame.body || '[]');
+            } catch (err) {
+                console.error('Unparseable snapshot', err, frame.body);
+            }
+            ui.trades.textContent = '';
+            tableReady = true;
+            trades.forEach(appendRow);          // newest-first already
+            if (trades.length > 0) { showLatest(trades[0]); }
+            ui.snapshot.textContent = trades.length;
+
+            clearTimeout(guard);
+            snapshotLoaded = true;
+            flushPendingLive();
+            snapshotSub.unsubscribe();          // one reply is all we need
+        });
+
+        // 2) live
+        client.subscribe(LIVE_DESTINATION, (frame) => {
+            let trade;
+            try {
+                trade = JSON.parse(frame.body);
+            } catch (err) {
+                console.error('Unparseable live payload', err, frame.body);
+                return;
+            }
+            if (!snapshotLoaded) {
+                pendingLive.push(trade);
+                return;
+            }
+            prependRow(trade);
+        });
+    };
+
+    client.onWebSocketClose = () => setStatus('down', 'Disconnected — reconnecting…');
+    client.onWebSocketError = () => setStatus('down', 'Transport error — reconnecting…');
+    client.onStompError = (frame) => {
+        setStatus('down', 'STOMP error: ' + (frame.headers['message'] || 'unknown'));
+    };
+
+    setStatus('wait', 'Connecting…');
+    client.activate();
+</script>
+</body>
+</html>
